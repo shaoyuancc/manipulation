@@ -36,6 +36,7 @@ rt_ipynb_test(
         "//manipulation/exercises/pick:test_robot_painter",
         "//manipulation:meshcat_utils",
         "//manipulation:scenarios",
+        "//manipulation:station",
     ],
 )
 
@@ -57,6 +58,6 @@ rt_ipynb_test(
         "//manipulation",
         "//manipulation/exercises:grader",
         "//manipulation/exercises/pick:test_differential_ik",
-        "//manipulation:scenarios",
+        "//manipulation:station",
     ],
 )

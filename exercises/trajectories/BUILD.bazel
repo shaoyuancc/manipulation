@@ -14,6 +14,7 @@ rt_ipynb_test(
         "//manipulation",
         "//manipulation:meshcat_utils",
         "//manipulation:scenarios",
+        "//manipulation:station",
         "//manipulation/exercises:grader",
         "//manipulation/exercises/trajectories:test_door_opening",
     ],
@@ -25,7 +26,7 @@ rt_ipynb_test(
     deps = [
         "//manipulation",
         "//manipulation:meshcat_utils",
-        "//manipulation:scenarios",
+        "//manipulation:station",
         "//manipulation/exercises:grader",
         "//manipulation/exercises/trajectories:test_rrt_planning",
         "//manipulation/exercises/trajectories/rrt_planner",

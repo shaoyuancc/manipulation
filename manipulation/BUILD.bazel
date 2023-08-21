@@ -41,9 +41,22 @@ rt_py_library(
 )
 
 rt_py_library(
+    name = "station",
+    srcs = ["station.py"],
+    deps = [
+        "//manipulation",
+        "//manipulation:scenarios",
+    ],
+    imports = [".."],
+    visibility = ["//visibility:public"],
+)
+
+rt_py_library(
     name = "scenarios",
     data = ["//manipulation/models"],
-    deps = ["//manipulation"],
+    deps = [
+        "//manipulation",
+    ],
     srcs = ["scenarios.py"],
     imports = [".."],
     visibility = ["//visibility:public"],
@@ -109,6 +122,7 @@ rt_py_test(
     imports = [".."],
     deps = [
       "manipulation",
+      "//manipulation:station",
       "mustard_depth_camera_example",
     ],
 )
