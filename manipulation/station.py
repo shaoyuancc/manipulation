@@ -1,4 +1,5 @@
 from pydrake.all import (
+    AddDefaultVisualization,
     Adder,
     AddMultibodyPlantSceneGraph,
     Demultiplexer,
@@ -31,6 +32,7 @@ def MakeManipulationStation(
     camera_prefix="camera",
     prefinalize_callback=None,
     package_xmls=[],
+    meshcat=None,
 ):
     """
     Creates a manipulation station system, which is a sub-diagram containing:
@@ -44,8 +46,6 @@ def MakeManipulationStation(
       - For each body starting with `camera_prefix`, we add a RgbdSensor
 
     Args:
-        builder: a DiagramBuilder
-
         model_directives: a string containing any model directives to be parsed
 
         filename: a string containing the name of an sdf, urdf, mujoco xml, or
@@ -70,6 +70,8 @@ def MakeManipulationStation(
         package_xmls: A list of filenames to be passed to
         PackageMap.AddPackageXml().  This is useful if you need to add more
         models to your path (e.g. from your current working directory).
+
+        meshcat: If not None, then AddDefaultVisualization will be added to the subdiagram using this meshcat instance.
     """
     builder = DiagramBuilder()
 
@@ -264,6 +266,9 @@ def MakeManipulationStation(
         plant.get_state_output_port(), "plant_continuous_state"
     )
     builder.ExportOutput(plant.get_body_poses_output_port(), "body_poses")
+
+    if meshcat:
+        AddDefaultVisualization(builder, meshcat=meshcat)
 
     diagram = builder.Build()
     diagram.set_name("ManipulationStation")

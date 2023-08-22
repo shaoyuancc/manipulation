@@ -42,6 +42,8 @@ from pydrake.all import (
     UnitInertia,
 )
 
+from enum import Enum
+
 from manipulation.utils import ConfigureParser
 
 ycb = [
@@ -52,6 +54,11 @@ ycb = [
     "009_gelatin_box.sdf",
     "010_potted_meat_can.sdf",
 ]
+
+
+class WsgPositions(Enum):
+    OPEN = 0.107
+    CLOSED = 0.002
 
 
 def AddIiwa(plant, collision_model="no_collision"):
