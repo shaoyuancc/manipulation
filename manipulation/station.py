@@ -1,18 +1,33 @@
+import time
+
 from pydrake.all import (
     AddDefaultVisualization,
     Adder,
     AddMultibodyPlantSceneGraph,
+    ApplyVisualizationConfig,
     Demultiplexer,
+    Diagram,
     DiagramBuilder,
+    DiscreteContactSolver,
+    DrakeLcm,
+    IiwaCommandSender,
+    IiwaStatusReceiver,
     InverseDynamicsController,
+    LcmInterfaceSystem,
+    LcmPublisherSystem,
+    LcmSubscriberSystem,
     MakeMultibodyStateToWsgStateSystem,
     ModelInstanceIndex,
     MultibodyPlant,
+    MultibodyPositionToGeometryPose,
     Parser,
     PassThrough,
+    SceneGraph,
     SchunkWsgPositionController,
     StateInterpolatorWithDiscreteDerivative,
+    VisualizationConfig,
 )
+from drake import lcmt_iiwa_command, lcmt_iiwa_status
 
 from manipulation.scenarios import (
     AddIiwa,
@@ -75,7 +90,6 @@ def MakeManipulationStation(
     """
     builder = DiagramBuilder()
 
-    # Add (only) the iiwa, WSG, and cameras to the scene.
     plant, scene_graph = AddMultibodyPlantSceneGraph(
         builder, time_step=time_step
     )
@@ -89,6 +103,7 @@ def MakeManipulationStation(
         parser.AddModelsFromUrl(filename)
     if prefinalize_callback:
         prefinalize_callback(plant)
+    plant.set_discrete_contact_solver(DiscreteContactSolver.kSap)
     plant.Finalize()
 
     for i in range(plant.num_model_instances()):
@@ -273,3 +288,159 @@ def MakeManipulationStation(
     diagram = builder.Build()
     diagram.set_name("ManipulationStation")
     return diagram
+
+
+def MakeManipulationStationHardwareInterface(
+    model_directives=None,
+    filename=None,
+    time_step=0.002,
+    iiwa_prefix="iiwa",
+    wsg_prefix="wsg",
+    camera_prefix="camera",
+    prefinalize_callback=None,
+    package_xmls=[],
+    meshcat=None,
+):
+    builder = DiagramBuilder()
+
+    lcm = DrakeLcm()
+    lcm_system = builder.AddNamedSystem("lcm", LcmInterfaceSystem(lcm=lcm))
+
+    # Visualization
+    scene_graph = builder.AddNamedSystem("scene_graph", SceneGraph())
+    plant = MultibodyPlant(time_step=0.0)
+    plant.RegisterAsSourceForSceneGraph(scene_graph)
+    Parser(plant).AddModelsFromString(model_directives, ".dmd.yaml")
+    plant.Finalize()
+    to_pose = builder.AddSystem(MultibodyPositionToGeometryPose(plant))
+    builder.Connect(
+        to_pose.get_output_port(),
+        scene_graph.get_source_pose_port(plant.get_source_id()),
+    )
+
+    config = VisualizationConfig()
+    config.publish_contacts = False
+    config.publish_inertia = False
+    ApplyVisualizationConfig(
+        config, builder=builder, plant=plant, meshcat=meshcat
+    )
+
+    iiwa_model_instance = None
+    wsg_model_instance = None
+    for i in range(plant.num_model_instances()):
+        model_instance = ModelInstanceIndex(i)
+        model_instance_name = plant.GetModelInstanceName(model_instance)
+
+        if model_instance_name.startswith(iiwa_prefix):
+            assert (
+                not iiwa_model_instance
+            ), "Still need to support multiple iiwas here"
+            iiwa_model_instance = model_instance
+
+        if model_instance_name.startswith(wsg_prefix):
+            assert (
+                not wsg_model_instance
+            ), "Still need to support multiple WSGs here"
+            wsg_model_instance = model_instance
+
+    # Publish IIWA command.
+    iiwa_command_sender = builder.AddSystem(IiwaCommandSender())
+    # Note on publish period: IIWA driver won't respond faster than 200Hz
+    iiwa_command_publisher = builder.AddSystem(
+        LcmPublisherSystem.Make(
+            channel="IIWA_COMMAND",
+            lcm_type=lcmt_iiwa_command,
+            lcm=lcm,
+            publish_period=0.005,
+            use_cpp_serializer=True,
+        )
+    )
+    builder.ExportInput(
+        iiwa_command_sender.get_position_input_port(), "iiwa_position"
+    )
+    builder.ExportInput(
+        iiwa_command_sender.get_torque_input_port(), "iiwa_feedforward_torque"
+    )
+    builder.Connect(
+        iiwa_command_sender.get_output_port(),
+        iiwa_command_publisher.get_input_port(),
+    )
+
+    # Receive IIWA status and populate the output ports.
+    iiwa_status_receiver = builder.AddSystem(IiwaStatusReceiver())
+    iiwa_status_subscriber = builder.AddSystem(
+        LcmSubscriberSystem.Make(
+            channel="IIWA_STATUS",
+            lcm_type=lcmt_iiwa_status,
+            lcm=lcm,
+            use_cpp_serializer=True,
+        )
+    )
+
+    assert not wsg_model_instance, "Still need to support WSG"
+    builder.Connect(
+        iiwa_status_receiver.get_position_measured_output_port(),
+        to_pose.get_input_port(),
+    )
+
+    builder.ExportOutput(
+        iiwa_status_receiver.get_position_commanded_output_port(),
+        "iiwa_position_commanded",
+    )
+    builder.ExportOutput(
+        iiwa_status_receiver.get_position_measured_output_port(),
+        "iiwa_position_measured",
+    )
+    builder.ExportOutput(
+        iiwa_status_receiver.get_velocity_estimated_output_port(),
+        "iiwa_velocity_estimated",
+    )
+    builder.ExportOutput(
+        iiwa_status_receiver.get_torque_commanded_output_port(),
+        "iiwa_torque_commanded",
+    )
+    builder.ExportOutput(
+        iiwa_status_receiver.get_torque_measured_output_port(),
+        "iiwa_torque_measured",
+    )
+    builder.ExportOutput(
+        iiwa_status_receiver.get_torque_external_output_port(),
+        "iiwa_torque_external",
+    )
+    builder.Connect(
+        iiwa_status_subscriber.get_output_port(),
+        iiwa_status_receiver.get_input_port(),
+    )
+
+    return builder.Build()
+
+
+def ConnectLcmSubscribers(diagram, context, timeout=10):
+    assert isinstance(diagram, Diagram)
+    diagram.ValidateContext(context)
+    if not diagram.HasSubsystemNamed("lcm"):
+        # For feature parity, calling this on the standard manipulation station
+        # should pass.
+        return True
+    lcm = diagram.GetSubsystemByName("lcm")
+    lcm.HandleSubscriptions(0)
+    timeout_time = time.time() + timeout
+    for s in diagram.GetSystems():
+        if isinstance(s, LcmSubscriberSystem):
+            print(
+                f"Waiting for first message on {s.get_name()}...",
+                end="",
+                flush=True,
+            )
+            count = 0
+            while time.time() < timeout_time:
+                count = s.WaitForMessage(0, timeout=0.01)
+                if count > 0:
+                    break
+                lcm.HandleSubscriptions(timeout_millis=10)
+            if count > 0:
+                print("Received.")
+            else:
+                print("TIMEOUT.")
+                return False
+    return True
