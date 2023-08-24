@@ -1,13 +1,25 @@
+import dataclasses as dc
+import typing
+
+import numpy as np
+
 from pydrake.all import (
     AddDefaultVisualization,
     Adder,
-    AddMultibodyPlantSceneGraph,
+    AddMultibodyPlant,
+    ApplyLcmBusConfig,
+    ApplyMultibodyPlantConfig,    
     ApplyVisualizationConfig,
+    CameraConfig,
     Demultiplexer,
     DiagramBuilder,
     DiscreteContactSolver,
     DrakeLcm,
+    DrakeLcmParams,
     IiwaCommandSender,
+    IiwaCommandReceiver,
+    IiwaDriver,
+    IiwaStatusSender,
     IiwaStatusReceiver,
     InverseDynamicsController,
     LcmInterfaceSystem,
@@ -15,15 +27,24 @@ from pydrake.all import (
     LcmSubscriberSystem,
     MakeMultibodyStateToWsgStateSystem,
     ModelInstanceIndex,
+    ModelDirective,
+    ModelDirectives,
     MultibodyPlant,
+    MultibodyPlantConfig,
     MultibodyPositionToGeometryPose,
     Parser,
     PassThrough,
+    ProcessModelDirectives,
     SceneGraph,
+    SchunkWsgDriver,
+    SchunkWsgStatusSender,
     SchunkWsgPositionController,
+    SimulatorConfig,
     StateInterpolatorWithDiscreteDerivative,
     VisualizationConfig,
+    ZeroForceDriver,
 )
+from pydrake.common.yaml import yaml_load_typed
 from drake import lcmt_iiwa_command, lcmt_iiwa_status
 
 from manipulation.scenarios import (
@@ -35,14 +56,254 @@ from manipulation.scenarios import (
 from manipulation.utils import ConfigureParser
 
 
-def MakeManipulationStation(
-    model_directives=None,
-    filename=None,
-    time_step=0.002,
-    iiwa_prefix="iiwa",
-    wsg_prefix="wsg",
-    camera_prefix="camera",
-    prefinalize_callback=None,
+@dc.dataclass
+class Scenario:
+    """Defines the YAML format for a (possibly stochastic) scenario to be
+    simulated.
+    """
+
+    # Random seed for any random elements in the scenario. The seed is always
+    # deterministic in the `Scenario`; a caller who wants randomness must
+    # populate this value from their own randomness.
+    random_seed: int = 0
+
+    # The maximum simulation time (in seconds).  The simulator will attempt to
+    # run until this time and then terminate.
+    simulation_duration: float = np.inf
+
+    # Simulator configuration (integrator and publisher parameters).
+    simulator_config: SimulatorConfig = SimulatorConfig(
+        max_step_size=1e-3,
+        accuracy=1.0e-2,
+        target_realtime_rate=1.0)
+
+    # Plant configuration (time step and contact parameters).
+    plant_config: MultibodyPlantConfig = MultibodyPlantConfig()
+
+    # All of the fully deterministic elements of the simulation.
+    directives: typing.List[ModelDirective] = dc.field(default_factory=list)
+
+    # A map of {bus_name: lcm_params} for LCM transceivers to be used by
+    # drivers, sensors, etc.
+    lcm_buses: typing.Mapping[str, DrakeLcmParams] = dc.field(
+        default_factory=lambda: dict(default=DrakeLcmParams()))
+
+    # For actuated models, specifies where each model's actuation inputs come
+    # from, keyed on the ModelInstance name.
+    model_drivers: typing.Mapping[str, typing.Union[
+        IiwaDriver,
+        SchunkWsgDriver,
+        ZeroForceDriver,
+    ]] = dc.field(default_factory=dict)
+
+    # Cameras to add to the scene (and broadcast over LCM). The key for each
+    # camera is a helpful mnemonic, but does not serve a technical role. The
+    # CameraConfig::name field is still the name that will appear in the
+    # Diagram artifacts.
+    cameras: typing.Mapping[str, CameraConfig] = dc.field(default_factory=dict)
+
+    visualization: VisualizationConfig = VisualizationConfig()
+
+
+def load_scenario(*, filename, scenario_name, scenario_text=""):
+    """Implements the command-line handling logic for scenario data.
+    Returns a `Scenario` object loaded from the given input arguments.
+    """
+    result = yaml_load_typed(
+        schema=Scenario,
+        filename=filename,
+        child_name=scenario_name,
+        defaults=Scenario())
+    if scenario_text:
+        result = yaml_load_typed(
+            schema=Scenario,
+            data=scenario_text,
+            defaults=result)
+    return result
+
+# TODO(russt): Use the c++ version pending https://github.com/RobotLocomotion/drake/issues/20055
+def ApplyDriverConfig(driver_config,
+            model_instance_name,
+            sim_plant,
+            models_from_directives_map,
+            lcm_buses,
+            builder):
+    model_instance = sim_plant.GetModelInstanceByName(model_instance_name)
+    if isinstance(driver_config, IiwaDriver):
+        num_iiwa_positions = sim_plant.num_positions(model_instance)
+
+        # I need a PassThrough system so that I can export the input port.
+        iiwa_position = builder.AddSystem(PassThrough(num_iiwa_positions))
+        builder.ExportInput(
+            iiwa_position.get_input_port(),
+            model_instance_name + "_position",
+        )
+        builder.ExportOutput(
+            iiwa_position.get_output_port(),
+            model_instance_name + "_position_commanded",
+        )
+
+        # Export the iiwa "state" outputs.
+        demux = builder.AddSystem(
+            Demultiplexer(2 * num_iiwa_positions, num_iiwa_positions)
+        )
+        builder.Connect(
+            sim_plant.get_state_output_port(model_instance),
+            demux.get_input_port(),
+        )
+        builder.ExportOutput(
+            demux.get_output_port(0),
+            model_instance_name + "_position_measured",
+        )
+        builder.ExportOutput(
+            demux.get_output_port(1),
+            model_instance_name + "_velocity_estimated",
+        )
+        builder.ExportOutput(
+            sim_plant.get_state_output_port(model_instance),
+            model_instance_name + "_state_estimated",
+        )
+
+        # Make the plant for the iiwa controller to use.
+        controller_plant = MultibodyPlant(time_step=sim_plant.time_step())
+        # TODO: Add the correct IIWA model (introspected from MBP)
+        if num_iiwa_positions == 3:
+            controller_iiwa = AddPlanarIiwa(controller_plant)
+        else:
+            controller_iiwa = AddIiwa(controller_plant)
+        AddWsg(controller_plant, controller_iiwa, welded=True)
+        controller_plant.Finalize()
+
+        # Add the iiwa controller
+        iiwa_controller = builder.AddSystem(
+            InverseDynamicsController(
+                controller_plant,
+                kp=[100] * num_iiwa_positions,
+                ki=[1] * num_iiwa_positions,
+                kd=[20] * num_iiwa_positions,
+                has_reference_acceleration=False,
+            )
+        )
+        iiwa_controller.set_name(model_instance_name + "_controller")
+        builder.Connect(
+            sim_plant.get_state_output_port(model_instance),
+            iiwa_controller.get_input_port_estimated_state(),
+        )
+
+        # Add in the feed-forward torque
+        adder = builder.AddSystem(Adder(2, num_iiwa_positions))
+        builder.Connect(
+            iiwa_controller.get_output_port_control(),
+            adder.get_input_port(0),
+        )
+        # Use a PassThrough to make the port optional (it will provide zero
+        # values if not connected).
+        torque_passthrough = builder.AddSystem(
+            PassThrough([0] * num_iiwa_positions)
+        )
+        builder.Connect(
+            torque_passthrough.get_output_port(), adder.get_input_port(1)
+        )
+        builder.ExportInput(
+            torque_passthrough.get_input_port(),
+            model_instance_name + "_feedforward_torque",
+        )
+        builder.Connect(
+            adder.get_output_port(),
+            sim_plant.get_actuation_input_port(model_instance),
+        )
+
+        # Add discrete derivative to command velocities.
+        desired_state_from_position = builder.AddSystem(
+            StateInterpolatorWithDiscreteDerivative(
+                num_iiwa_positions,
+                sim_plant.time_step(),
+                suppress_initial_transient=True,
+            )
+        )
+        desired_state_from_position.set_name(
+            model_instance_name + "_desired_state_from_position"
+        )
+        builder.Connect(
+            desired_state_from_position.get_output_port(),
+            iiwa_controller.get_input_port_desired_state(),
+        )
+        builder.Connect(
+            iiwa_position.get_output_port(),
+            desired_state_from_position.get_input_port(),
+        )
+
+        # Export commanded torques.
+        builder.ExportOutput(
+            adder.get_output_port(),
+            model_instance_name + "_torque_commanded",
+        )
+        builder.ExportOutput(
+            adder.get_output_port(),
+            model_instance_name + "_torque_measured",
+        )
+
+        builder.ExportOutput(
+            sim_plant.get_generalized_contact_forces_output_port(
+                model_instance
+            ),
+            model_instance_name + "_torque_external",
+        )
+
+    if isinstance(driver_config, SchunkWsgDriver):
+        # Wsg controller.
+        wsg_controller = builder.AddSystem(SchunkWsgPositionController())
+        wsg_controller.set_name(model_instance_name + "_controller")
+        builder.Connect(
+            wsg_controller.get_generalized_force_output_port(),
+            sim_plant.get_actuation_input_port(model_instance),
+        )
+        builder.Connect(
+            sim_plant.get_state_output_port(model_instance),
+            wsg_controller.get_state_input_port(),
+        )
+        builder.ExportInput(
+            wsg_controller.get_desired_position_input_port(),
+            model_instance_name + "_position",
+        )
+        builder.ExportInput(
+            wsg_controller.get_force_limit_input_port(),
+            model_instance_name + "_force_limit",
+        )
+        wsg_mbp_state_to_wsg_state = builder.AddSystem(
+            MakeMultibodyStateToWsgStateSystem()
+        )
+        builder.Connect(
+            sim_plant.get_state_output_port(model_instance),
+            wsg_mbp_state_to_wsg_state.get_input_port(),
+        )
+        builder.ExportOutput(
+            wsg_mbp_state_to_wsg_state.get_output_port(),
+            model_instance_name + "_state_measured",
+        )
+        builder.ExportOutput(
+            wsg_controller.get_grip_force_output_port(),
+            model_instance_name + "_force_measured",
+        )
+
+
+def ApplyDriverConfigs(*, driver_configs, sim_plant, models_from_directives,
+                       lcm_buses, builder):
+    models_from_directives_map = dict([
+        (info.model_name, info)
+        for info in models_from_directives
+    ])
+    for model_instance_name, driver_config in driver_configs.items():
+        ApplyDriverConfig(
+            driver_config,
+            model_instance_name,
+            sim_plant,
+            models_from_directives_map,
+            lcm_buses,
+            builder)
+        
+def MakeHardwareStation(
+    scenario: Scenario,
     package_xmls=[],
     meshcat=None,
 ):
@@ -87,207 +348,59 @@ def MakeManipulationStation(
     """
     builder = DiagramBuilder()
 
-    plant, scene_graph = AddMultibodyPlantSceneGraph(
-        builder, time_step=time_step
-    )
-    parser = Parser(plant)
+    # Create the multibody plant and scene graph.
+    sim_plant, scene_graph = AddMultibodyPlant(
+        config=scenario.plant_config,
+        builder=builder)
+
+    parser = Parser(sim_plant)
     for p in package_xmls:
         parser.package_map().AddPackageXml(p)
     ConfigureParser(parser)
-    if model_directives:
-        parser.AddModelsFromString(model_directives, ".dmd.yaml")
-    if filename:
-        parser.AddModelsFromUrl(filename)
-    if prefinalize_callback:
-        prefinalize_callback(plant)
-    plant.set_discrete_contact_solver(DiscreteContactSolver.kSap)
-    plant.Finalize()
 
-    for i in range(plant.num_model_instances()):
-        model_instance = ModelInstanceIndex(i)
-        model_instance_name = plant.GetModelInstanceName(model_instance)
+    # Add model directives.
+    added_models = ProcessModelDirectives(
+        directives=ModelDirectives(directives=scenario.directives),
+        parser=parser)
 
-        if model_instance_name.startswith(iiwa_prefix):
-            num_iiwa_positions = plant.num_positions(model_instance)
+    # Now the plant is complete.
+    sim_plant.Finalize()
 
-            # I need a PassThrough system so that I can export the input port.
-            iiwa_position = builder.AddSystem(PassThrough(num_iiwa_positions))
-            builder.ExportInput(
-                iiwa_position.get_input_port(),
-                model_instance_name + "_position",
-            )
-            builder.ExportOutput(
-                iiwa_position.get_output_port(),
-                model_instance_name + "_position_commanded",
-            )
+    print(scenario.model_drivers)
 
-            # Export the iiwa "state" outputs.
-            demux = builder.AddSystem(
-                Demultiplexer(2 * num_iiwa_positions, num_iiwa_positions)
-            )
-            builder.Connect(
-                plant.get_state_output_port(model_instance),
-                demux.get_input_port(),
-            )
-            builder.ExportOutput(
-                demux.get_output_port(0),
-                model_instance_name + "_position_measured",
-            )
-            builder.ExportOutput(
-                demux.get_output_port(1),
-                model_instance_name + "_velocity_estimated",
-            )
-            builder.ExportOutput(
-                plant.get_state_output_port(model_instance),
-                model_instance_name + "_state_estimated",
-            )
+    # Add actuation inputs.
+    ApplyDriverConfigs(
+        driver_configs=scenario.model_drivers,
+        sim_plant=sim_plant,
+        models_from_directives=added_models,
+        lcm_buses=scenario.lcm_buses,
+        builder=builder)
 
-            # Make the plant for the iiwa controller to use.
-            controller_plant = MultibodyPlant(time_step=time_step)
-            # TODO: Add the correct IIWA model (introspected from MBP)
-            if plant.num_positions(model_instance) == 3:
-                controller_iiwa = AddPlanarIiwa(controller_plant)
-            else:
-                controller_iiwa = AddIiwa(controller_plant)
-            AddWsg(controller_plant, controller_iiwa, welded=True)
-            controller_plant.Finalize()
+    # for system in builder.GetMutableSystems():
+    #     if isinstance(system, (LcmInterfaceSystem, LcmSubscriberSystem,LcmPublisherSystem, IiwaCommandReceiver, IiwaStatusSender, SchunkWsgStatusSender)):
+    #         builder.RemoveSystem(system)
 
-            # Add the iiwa controller
-            iiwa_controller = builder.AddSystem(
-                InverseDynamicsController(
-                    controller_plant,
-                    kp=[100] * num_iiwa_positions,
-                    ki=[1] * num_iiwa_positions,
-                    kd=[20] * num_iiwa_positions,
-                    has_reference_acceleration=False,
-                )
-            )
-            iiwa_controller.set_name(model_instance_name + "_controller")
-            builder.Connect(
-                plant.get_state_output_port(model_instance),
-                iiwa_controller.get_input_port_estimated_state(),
-            )
+    # TODO(russt): Add scene cameras. https://github.com/RobotLocomotion/drake/issues/20055
 
-            # Add in the feed-forward torque
-            adder = builder.AddSystem(Adder(2, num_iiwa_positions))
-            builder.Connect(
-                iiwa_controller.get_output_port_control(),
-                adder.get_input_port(0),
-            )
-            # Use a PassThrough to make the port optional (it will provide zero
-            # values if not connected).
-            torque_passthrough = builder.AddSystem(
-                PassThrough([0] * num_iiwa_positions)
-            )
-            builder.Connect(
-                torque_passthrough.get_output_port(), adder.get_input_port(1)
-            )
-            builder.ExportInput(
-                torque_passthrough.get_input_port(),
-                model_instance_name + "_feedforward_torque",
-            )
-            builder.Connect(
-                adder.get_output_port(),
-                plant.get_actuation_input_port(model_instance),
-            )
-
-            # Add discrete derivative to command velocities.
-            desired_state_from_position = builder.AddSystem(
-                StateInterpolatorWithDiscreteDerivative(
-                    num_iiwa_positions,
-                    time_step,
-                    suppress_initial_transient=True,
-                )
-            )
-            desired_state_from_position.set_name(
-                model_instance_name + "_desired_state_from_position"
-            )
-            builder.Connect(
-                desired_state_from_position.get_output_port(),
-                iiwa_controller.get_input_port_desired_state(),
-            )
-            builder.Connect(
-                iiwa_position.get_output_port(),
-                desired_state_from_position.get_input_port(),
-            )
-
-            # Export commanded torques.
-            builder.ExportOutput(
-                adder.get_output_port(),
-                model_instance_name + "_torque_commanded",
-            )
-            builder.ExportOutput(
-                adder.get_output_port(),
-                model_instance_name + "_torque_measured",
-            )
-
-            builder.ExportOutput(
-                plant.get_generalized_contact_forces_output_port(
-                    model_instance
-                ),
-                model_instance_name + "_torque_external",
-            )
-
-        elif model_instance_name.startswith(wsg_prefix):
-            # Wsg controller.
-            wsg_controller = builder.AddSystem(SchunkWsgPositionController())
-            wsg_controller.set_name(model_instance_name + "_controller")
-            builder.Connect(
-                wsg_controller.get_generalized_force_output_port(),
-                plant.get_actuation_input_port(model_instance),
-            )
-            builder.Connect(
-                plant.get_state_output_port(model_instance),
-                wsg_controller.get_state_input_port(),
-            )
-            builder.ExportInput(
-                wsg_controller.get_desired_position_input_port(),
-                model_instance_name + "_position",
-            )
-            builder.ExportInput(
-                wsg_controller.get_force_limit_input_port(),
-                model_instance_name + "_force_limit",
-            )
-            wsg_mbp_state_to_wsg_state = builder.AddSystem(
-                MakeMultibodyStateToWsgStateSystem()
-            )
-            builder.Connect(
-                plant.get_state_output_port(model_instance),
-                wsg_mbp_state_to_wsg_state.get_input_port(),
-            )
-            builder.ExportOutput(
-                wsg_mbp_state_to_wsg_state.get_output_port(),
-                model_instance_name + "_state_measured",
-            )
-            builder.ExportOutput(
-                wsg_controller.get_grip_force_output_port(),
-                model_instance_name + "_force_measured",
-            )
-
-    # Cameras.
-    AddRgbdSensors(
-        builder, plant, scene_graph, model_instance_prefix=camera_prefix
-    )
+    # Add visualization.
+    ApplyVisualizationConfig(scenario.visualization, builder, meshcat=meshcat)
 
     # Export "cheat" ports.
     builder.ExportOutput(scene_graph.get_query_output_port(), "query_object")
     builder.ExportOutput(
-        plant.get_contact_results_output_port(), "contact_results"
+        sim_plant.get_contact_results_output_port(), "contact_results"
     )
     builder.ExportOutput(
-        plant.get_state_output_port(), "plant_continuous_state"
+        sim_plant.get_state_output_port(), "plant_continuous_state"
     )
-    builder.ExportOutput(plant.get_body_poses_output_port(), "body_poses")
-
-    if meshcat:
-        AddDefaultVisualization(builder, meshcat=meshcat)
+    builder.ExportOutput(sim_plant.get_body_poses_output_port(), "body_poses")
 
     diagram = builder.Build()
     diagram.set_name("ManipulationStation")
     return diagram
 
 
-def MakeManipulationStationHardwareInterface(
+def MakeHardwareStationInterface(
     model_directives=None,
     filename=None,
     time_step=0.002,
