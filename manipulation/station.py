@@ -1,12 +1,9 @@
-import time
-
 from pydrake.all import (
     AddDefaultVisualization,
     Adder,
     AddMultibodyPlantSceneGraph,
     ApplyVisualizationConfig,
     Demultiplexer,
-    Diagram,
     DiagramBuilder,
     DiscreteContactSolver,
     DrakeLcm,
@@ -374,6 +371,7 @@ def MakeManipulationStationHardwareInterface(
             lcm_type=lcmt_iiwa_status,
             lcm=lcm,
             use_cpp_serializer=True,
+            wait_for_message_on_initialization_timeout=10,
         )
     )
 
@@ -413,34 +411,3 @@ def MakeManipulationStationHardwareInterface(
     )
 
     return builder.Build()
-
-
-def ConnectLcmSubscribers(diagram, context, timeout=10):
-    assert isinstance(diagram, Diagram)
-    diagram.ValidateContext(context)
-    if not diagram.HasSubsystemNamed("lcm"):
-        # For feature parity, calling this on the standard manipulation station
-        # should pass.
-        return True
-    lcm = diagram.GetSubsystemByName("lcm")
-    lcm.HandleSubscriptions(0)
-    timeout_time = time.time() + timeout
-    for s in diagram.GetSystems():
-        if isinstance(s, LcmSubscriberSystem):
-            print(
-                f"Waiting for first message on {s.get_name()}...",
-                end="",
-                flush=True,
-            )
-            count = 0
-            while time.time() < timeout_time:
-                count = s.WaitForMessage(0, timeout=0.01)
-                if count > 0:
-                    break
-                lcm.HandleSubscriptions(timeout_millis=10)
-            if count > 0:
-                print("Received.")
-            else:
-                print("TIMEOUT.")
-                return False
-    return True
