@@ -1,0 +1,43 @@
+# This demo simulation shows an IIWA arm with an attached WSG gripper.
+Demo:
+  directives:
+  - add_model:
+      name: iiwa_left
+      file: package://drake/manipulation/models/iiwa_description/urdf/iiwa14_primitive_collision.urdf
+      default_joint_positions:
+        iiwa_joint_1: [0]
+        iiwa_joint_2: [0.1]
+        iiwa_joint_3: [0]
+        iiwa_joint_4: [-1.2]
+        iiwa_joint_5: [0]
+        iiwa_joint_6: [1.6]
+        iiwa_joint_7: [0]
+  - add_weld:
+      parent: world
+      child: iiwa_left::base
+  - add_model:
+      name: iiwa_right
+      file: package://drake/manipulation/models/iiwa_description/urdf/iiwa14_primitive_collision.urdf
+      default_joint_positions:
+        iiwa_joint_1: [0]
+        iiwa_joint_2: [0.1]
+        iiwa_joint_3: [0]
+        iiwa_joint_4: [-1.2]
+        iiwa_joint_5: [0]
+        iiwa_joint_6: [1.6]
+        iiwa_joint_7: [0]
+  - add_weld:
+      parent: world
+      child: iiwa_right::base
+      X_PC:
+        translation: [0, 0.7, 0]
+  model_drivers:
+    iiwa_left: !IiwaDriver
+      hand_model_name: ""
+    iiwa_right: !IiwaDriver
+      hand_model_name: ""
+  lcm_buses:
+    iiwa_left:
+      channel_suffix: _left
+    iiwa_right:
+      channel_suffix: _right
