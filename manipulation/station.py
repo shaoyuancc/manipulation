@@ -441,20 +441,20 @@ def MakeHardwareStationInterface(
     for model_instance_name, driver_config in scenario.model_drivers.items():
         if isinstance(driver_config, IiwaDriver):
             lcm = lcm_buses.Find("Driver for " + model_instance_name, driver_config.lcm_bus)
-            channel_suffix = scenario.lcm_buses[model_instance_name].channel_suffix if model_instance_name in scenario.lcm_buses else ""
 
             # Publish IIWA command.
             iiwa_command_sender = builder.AddSystem(IiwaCommandSender())
             # Note on publish period: IIWA driver won't respond faster than 200Hz
             iiwa_command_publisher = builder.AddSystem(
                 LcmPublisherSystem.Make(
-                    channel="IIWA_COMMAND" + channel_suffix,
+                    channel="IIWA_COMMAND",
                     lcm_type=lcmt_iiwa_command,
                     lcm=lcm,
                     publish_period=0.005,
                     use_cpp_serializer=True,
                 )
             )
+            iiwa_command_publisher.set_name(model_instance_name + "_command_publisher")
             builder.ExportInput(
                 iiwa_command_sender.get_position_input_port(), model_instance_name + "_position"
             )
@@ -469,13 +469,14 @@ def MakeHardwareStationInterface(
             iiwa_status_receiver = builder.AddSystem(IiwaStatusReceiver())
             iiwa_status_subscriber = builder.AddSystem(
                 LcmSubscriberSystem.Make(
-                    channel="IIWA_STATUS" + channel_suffix,
+                    channel="IIWA_STATUS",
                     lcm_type=lcmt_iiwa_status,
                     lcm=lcm,
                     use_cpp_serializer=True,
                     wait_for_message_on_initialization_timeout=10,
                 )
             )
+            iiwa_status_subscriber.set_name(model_instance_name + "_status_subscriber")
 
             #builder.Connect(
             #    iiwa_status_receiver.get_position_measured_output_port(),

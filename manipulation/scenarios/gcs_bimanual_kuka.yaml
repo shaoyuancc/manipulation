@@ -31,13 +31,15 @@ Demo:
       child: iiwa_right::base
       X_PC:
         translation: [0, 0.7, 0]
+  lcm_buses:
+    left_lcm:
+      channel_suffix: _LEFT
+    right_lcm:
+      channel_suffix: _RIGHT
   model_drivers:
     iiwa_left: !IiwaDriver
       hand_model_name: ""
+      lcm_bus: left_lcm
     iiwa_right: !IiwaDriver
       hand_model_name: ""
-  lcm_buses:
-    iiwa_left:
-      channel_suffix: _left
-    iiwa_right:
-      channel_suffix: _right
+      lcm_bus: right_lcm
